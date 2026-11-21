@@ -1,6 +1,11 @@
 .env
 __pycache__/
 *.py[cod]
-data/
 *.db
+*.db-shm
+*.db-wal
+data/
 .venv/
+venv/
+.idea/
+.vscode/
