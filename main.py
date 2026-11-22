@@ -5,7 +5,6 @@ import re
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 
-# --- Настройки ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "417850992"))
 DB_PATH = os.getenv("DATABASE_PATH", "voices.db")
@@ -16,7 +15,6 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# --- База данных ---
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -40,17 +38,11 @@ def is_owner(uid): return uid == OWNER_ID
 def is_priv(ctype): return ctype == "private"
 
 # ============================================================
-#  📌 INLINE MODE — вот что даёт список с ▶️ как на скрине
+#  INLINE MODE — список с ▶️ при @твой_бот
 # ============================================================
 @dp.inline_handler()
 async def inline_voice(query: types.InlineQuery):
-    """
-    Пользователь пишет @твой_бот или @твой_бот текст
-    Бот показывает список голосовых с кнопками ▶️
-    """
     text = (query.query or "").strip().lower()
-
-    # Получаем все голосовые (или фильтруем по названию)
     if text:
         cursor = conn.execute(
             "SELECT id, title, file_id, play_count FROM voices "
@@ -77,13 +69,11 @@ async def inline_voice(query: types.InlineQuery):
         vid = row["id"]
         title = row["title"]
         plays = row["play_count"] or 0
-
-        # 🔑 InlineQueryResultVoice — именно он рисует синий ▶️
         results.append(
             types.InlineQueryResultVoice(
                 type="voice",
                 id=f"v{vid}",
-                voice_url="",          # пусто — используем file_id
+                voice_url="",
                 voice_file_id=row["file_id"],
                 title=f"{title}  🎵{plays}",
                 caption=f"/{vid}. {title} ({plays})",
@@ -94,25 +84,38 @@ async def inline_voice(query: types.InlineQuery):
     await query.answer(
         results,
         cache_time=1,
-        is_private=False,       # True = каждый видит только свои результаты
+        is_private=False,
         switch_pm_text="📚 Открыть каталог",
         switch_pm_parameter="catalog",
     )
 
-
 # ============================================================
-#  📌 Команды (как раньше)
+#  КОМАНДЫ
 # ============================================================
 @dp.message_handler(commands=['start', 'help'])
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "👋 Я библиотека голосовых.\n\n"
-        "📌 В любом чате напиши @твой_бот — откроется список ▶️\n"
-        "📚 /voices — каталог\n"
-        "🎲 /randomvoice — случайное\n"
-        "🔢 /1, /2, /3… — воспроизвести\n\n"
-        "⚙️ Управление: /addvoice, /deletevoice, /renamevoice, /stats"
-    )
+    if is_owner(message.from_user.id):
+        await message.answer(
+            "👋 Привет! Я библиотека голосовых.\n\n"
+            "📌 В любом чате напиши @твой_бот — откроется список ▶️\n"
+            "📚 /voices — каталог\n"
+            "🎲 /randomvoice — случайное\n"
+            "🔢 /1, /2, /3… — воспроизвести\n\n"
+            "⚙️ Управление (только для тебя):\n"
+            "/addvoice — добавить голосовое\n"
+            "/deletevoice 5 — удалить №5\n"
+            "/renamevoice 5 Новое название — переименовать\n"
+            "/stats — статистика\n"
+            "/cancel — отменить добавление"
+        )
+    else:
+        await message.answer(
+            "👋 Привет! Я библиотека голосовых.\n\n"
+            "📌 В любом чате напиши @твой_бот — откроется список ▶️\n"
+            "📚 /voices — каталог\n"
+            "🎲 /randomvoice — случайное голосовое\n"
+            "🔢 /1, /2, /3… — воспроизвести по номеру"
+        )
 
 @dp.message_handler(commands=['addvoice'])
 async def cmd_add(message: types.Message):
@@ -199,7 +202,7 @@ async def handle_text(message: types.Message):
             return await message.answer_voice(row['file_id'])
         return await message.answer("📚 Пусто.")
 
-    # Админ
+    # Админ-команды (только владелец в личке)
     if is_owner(uid) and is_priv(ctype):
         if text.startswith('/deletevoice '):
             parts = text.split()
