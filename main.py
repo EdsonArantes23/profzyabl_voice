@@ -1,3 +1,4 @@
+
 import asyncio
 import html
 import logging
@@ -7,152 +8,161 @@ from pathlib import Path
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
     BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/voices.db")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-PAGE_SIZE = int(os.getenv("PAGE_SIZE", "25"))
-
+OWNER_ID_RAW = os.getenv("OWNER_ID", "417850992").strip()
 OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.isdigit() else None
+
+DATABASE_PATH = os.getenv("DATABASE_PATH", "/app/data/voices.db")
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "25"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+log = logging.getLogger("voice-library")
 
-log = logging.getLogger("voice_library")
+
+def is_owner(message: Message):
+    return bool(
+        message.from_user
+        and OWNER_ID
+        and message.from_user.id == OWNER_ID
+    )
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+def is_private(message: Message):
+    return message.chat.type == "private"
 
-async def table_columns(db, table_name):
-    async with db.execute(
-        f"PRAGMA table_info({table_name})"
-    ) as cursor:
-        rows = await cursor.fetchall()
 
+async def get_columns(db, table):
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    rows = await cursor.fetchall()
+    await cursor.close()
     return {row["name"] for row in rows}
 
 
 async def init_db():
-    Path(DATABASE_PATH).parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    db_path = Path(DATABASE_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    db = await aiosqlite.connect(DATABASE_PATH)
+    db = await aiosqlite.connect(str(db_path))
     db.row_factory = aiosqlite.Row
 
-    await db.execute("PRAGMA busy_timeout = 5000")
-    await db.execute("PRAGMA journal_mode = WAL")
+    await db.execute("PRAGMA busy_timeout=5000")
+    await db.execute("PRAGMA journal_mode=WAL")
 
-    # Create the table if it does not exist.
     await db.execute("""
         CREATE TABLE IF NOT EXISTS voices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL DEFAULT 'Без названия',
+            title TEXT NOT NULL,
             file_id TEXT NOT NULL,
             play_count INTEGER NOT NULL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    columns = await table_columns(db, "voices")
+    cols = await get_columns(db, "voices")
 
-    # Find an existing file_id column before migration.
-    file_column = None
-    for candidate in (
-        "file_id",
-        "telegram_file_id",
-        "voice_file_id",
-    ):
-        if candidate in columns:
-            file_column = candidate
-            break
-
-    if file_column is None:
+    if "id" not in cols:
         raise RuntimeError(
-            "В таблице voices отсутствует file_id. "
-            "Автоматическая миграция остановлена, "
-            "чтобы не повредить старые данные."
+            "В старой таблице voices отсутствует колонка id. "
+            "Автоматическая миграция остановлена."
         )
 
-    # Add missing title column.
-    if "title" not in columns:
-        await db.execute("""
-            ALTER TABLE voices
-            ADD COLUMN title TEXT NOT NULL DEFAULT 'Без названия'
-        """)
-        log.info("Database migration: title added")
+    file_col = next(
+        (
+            name for name in (
+                "file_id",
+                "telegram_file_id",
+                "voice_file_id"
+            )
+            if name in cols
+        ),
+        None
+    )
 
-        # Copy names from an older version, if available.
-        for old_name in ("name", "voice_name", "command"):
-            if old_name in columns:
-                await db.execute(f"""
-                    UPDATE voices
-                    SET title = "{old_name}"
-                    WHERE "{old_name}" IS NOT NULL
-                      AND TRIM(CAST("{old_name}" AS TEXT)) != ''
-                """)
-                break
+    if file_col is None:
+        raise RuntimeError(
+            "Не найдена колонка file_id. "
+            "Проверьте структуру старой базы данных."
+        )
 
-    # Add missing play counter.
-    if "play_count" not in columns:
-        await db.execute("""
-            ALTER TABLE voices
-            ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0
-        """)
-        log.info("Database migration: play_count added")
+    if "title" not in cols:
+        await db.execute(
+            "ALTER TABLE voices ADD COLUMN title TEXT NOT NULL DEFAULT ''"
+        )
 
-        for old_counter in ("plays", "views", "count"):
-            if old_counter in columns:
-                await db.execute(f"""
-                    UPDATE voices
-                    SET play_count = COALESCE("{old_counter}", 0)
-                """)
-                break
+        old_title = next(
+            (
+                name for name in ("name", "voice_name", "command")
+                if name in cols
+            ),
+            None
+        )
 
-    # Add missing creation date.
-    if "created_at" not in columns:
-        await db.execute("""
-            ALTER TABLE voices
-            ADD COLUMN created_at TIMESTAMP
-        """)
-        log.info("Database migration: created_at added")
+        if old_title:
+            await db.execute(
+                f'UPDATE voices SET title = "{old_title}" '
+                "WHERE title = ''"
+            )
+        else:
+            await db.execute(
+                "UPDATE voices SET title = 'Голосовое ' || id "
+                "WHERE title = ''"
+            )
 
-    # Normalize an older file ID column name if necessary.
-    if file_column != "file_id":
-        current_columns = await table_columns(db, "voices")
-        if "file_id" not in current_columns:
-            await db.execute("""
-                ALTER TABLE voices
-                ADD COLUMN file_id TEXT
-            """)
-            await db.execute(f"""
-                UPDATE voices
-                SET file_id = "{file_column}"
-            """)
-            log.info("Database migration: file_id copied")
+    cols = await get_columns(db, "voices")
 
-    # Pending operations are temporary. Recreate only if the
-    # old table has an incompatible structure.
+    if "play_count" not in cols:
+        await db.execute(
+            "ALTER TABLE voices ADD COLUMN "
+            "play_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+        old_count = next(
+            (
+                name for name in ("plays", "views", "count")
+                if name in cols
+            ),
+            None
+        )
+
+        if old_count:
+            await db.execute(
+                f'UPDATE voices SET play_count = COALESCE("{old_count}", 0)'
+            )
+
+    cols = await get_columns(db, "voices")
+
+    if "created_at" not in cols:
+        await db.execute(
+            "ALTER TABLE voices ADD COLUMN created_at TEXT"
+        )
+        await db.execute(
+            "UPDATE voices SET created_at = CURRENT_TIMESTAMP "
+            "WHERE created_at IS NULL"
+        )
+
+    if file_col != "file_id":
+        await db.execute(
+            "ALTER TABLE voices ADD COLUMN file_id TEXT"
+        )
+        await db.execute(
+            f'UPDATE voices SET file_id = "{file_col}" '
+            "WHERE file_id IS NULL"
+        )
+
     await db.execute("""
         CREATE TABLE IF NOT EXISTS pending (
             owner_id INTEGER PRIMARY KEY,
@@ -161,102 +171,66 @@ async def init_db():
         )
     """)
 
-    pending_columns = await table_columns(db, "pending")
-    if not {"owner_id", "stage", "file_id"}.issubset(pending_columns):
-        log.warning("Recreating incompatible temporary pending table")
-        await db.execute("DROP TABLE pending")
-        await db.execute("""
-            CREATE TABLE pending (
-                owner_id INTEGER PRIMARY KEY,
-                stage TEXT NOT NULL,
-                file_id TEXT
-            )
-        """)
-
     await db.commit()
 
-    log.info("Database initialized: %s", DATABASE_PATH)
+    log.info("Database initialized: %s", db_path)
     return db
 
 
-# ============================================================
-# ACCESS CHECKS
-# ============================================================
-
-def is_owner(message: Message):
-    return (
-        message.from_user is not None
-        and message.from_user.id == OWNER_ID
+async def get_pending(db):
+    cursor = await db.execute(
+        "SELECT * FROM pending WHERE owner_id=?",
+        (OWNER_ID,)
     )
+    row = await cursor.fetchone()
+    await cursor.close()
+    return row
 
 
-def is_private(message: Message):
-    return message.chat.type == ChatType.PRIVATE
-
-
-async def require_owner_private(message: Message):
+async def start_add(message: Message, db):
     if not is_owner(message):
         await message.answer(
-            "Эта команда доступна только администратору."
+            "Добавлять голосовые может только администратор."
         )
-        return False
+        return
 
     if not is_private(message):
         await message.answer(
-            "Эта команда работает только в личке с ботом."
+            "Добавление доступно только в личке с ботом."
         )
-        return False
-
-    return True
-
-
-# ============================================================
-# DATABASE HELPERS
-# ============================================================
-
-async def get_pending(db):
-    async with db.execute(
-        "SELECT * FROM pending WHERE owner_id = ?",
-        (OWNER_ID,),
-    ) as cursor:
-        return await cursor.fetchone()
-
-
-async def get_voice_count(db):
-    async with db.execute(
-        "SELECT COUNT(*) AS total FROM voices"
-    ) as cursor:
-        row = await cursor.fetchone()
-        return row["total"]
-
-
-# ============================================================
-# ADD VOICE
-# ============================================================
-
-async def add_voice_start(message: Message, db):
-    if not await require_owner_private(message):
         return
 
     await db.execute("""
         INSERT INTO pending(owner_id, stage, file_id)
         VALUES(?, 'voice', NULL)
         ON CONFLICT(owner_id)
-        DO UPDATE SET stage = 'voice', file_id = NULL
+        DO UPDATE SET stage='voice', file_id=NULL
     """, (OWNER_ID,))
 
     await db.commit()
 
     await message.answer(
-        "🎙 <b>Добавление голосового</b>\n\n"
-        "Отправь мне голосовое сообщение.\n"
+        "Отправь мне голосовое сообщение.\n\n"
         "После этого я попрошу написать его название.\n\n"
-        "Для отмены используй /cancel",
-        parse_mode="HTML",
+        "Для отмены: /cancel"
     )
 
 
-async def receive_voice(message: Message, db):
+async def cancel_add(message: Message, db):
+    if not is_owner(message) or not is_private(message):
+        await message.answer("Недостаточно прав.")
+        return
+
+    await db.execute(
+        "DELETE FROM pending WHERE owner_id=?",
+        (OWNER_ID,)
+    )
+    await db.commit()
+
+    await message.answer("Добавление отменено.")
+
+
+async def accept_voice(message: Message, db):
     if not is_owner(message) or not is_private(message):
         return
 
@@ -267,19 +241,19 @@ async def receive_voice(message: Message, db):
 
     await db.execute("""
         UPDATE pending
-        SET stage = 'title', file_id = ?
-        WHERE owner_id = ?
+        SET stage='title', file_id=?
+        WHERE owner_id=?
     """, (message.voice.file_id, OWNER_ID))
 
     await db.commit()
 
     await message.answer(
-        "✅ Голосовое получено!\n\n"
-        "Теперь напиши его название."
+        "Теперь отправь название голосового.\n"
+        "Максимум 200 символов."
     )
 
 
-async def receive_title(message: Message, db):
+async def accept_title(message: Message, db):
     if not is_owner(message) or not is_private(message):
         return False
 
@@ -290,11 +264,8 @@ async def receive_title(message: Message, db):
 
     title = (message.text or "").strip()
 
-    if not title or title.startswith("/"):
-        await message.answer(
-            "Напиши название обычным текстом. "
-            "Для отмены используй /cancel."
-        )
+    if not title:
+        await message.answer("Название не должно быть пустым.")
         return True
 
     if len(title) > 200:
@@ -304,80 +275,49 @@ async def receive_title(message: Message, db):
         return True
 
     if not pending["file_id"]:
-        await message.answer(
-            "Не удалось найти файл голосового. "
-            "Начни добавление заново командой /addvoice."
-        )
         await db.execute(
-            "DELETE FROM pending WHERE owner_id = ?",
-            (OWNER_ID,),
+            "DELETE FROM pending WHERE owner_id=?",
+            (OWNER_ID,)
         )
         await db.commit()
-        return True
-
-    try:
-        async with db.execute("""
-            INSERT INTO voices(title, file_id)
-            VALUES(?, ?)
-        """, (title, pending["file_id"])) as cursor:
-            voice_id = cursor.lastrowid
-
-        await db.execute(
-            "DELETE FROM pending WHERE owner_id = ?",
-            (OWNER_ID,),
-        )
-        await db.commit()
-
-    except Exception:
-        await db.rollback()
-        log.exception("Failed to save voice")
         await message.answer(
-            "❌ Не удалось сохранить голосовое. "
-            "Проверь логи бота."
+            "Файл голосового не найден. Начни заново: /addvoice"
         )
         return True
 
-    await message.answer(
-        "✅ <b>Голосовое успешно сохранено!</b>\n\n"
-        f"Номер: №{voice_id}\n"
-        f"Название: {html.escape(title)}\n\n"
-        f"Команда вызова: <code>/{voice_id}</code>",
-        parse_mode="HTML",
+    cursor = await db.execute(
+        "INSERT INTO voices(title, file_id) VALUES(?, ?)",
+        (title, pending["file_id"])
     )
 
-    log.info(
-        "Voice added: id=%s owner=%s title=%s",
-        voice_id,
-        OWNER_ID,
-        title,
+    voice_id = cursor.lastrowid
+    await cursor.close()
+
+    await db.execute(
+        "DELETE FROM pending WHERE owner_id=?",
+        (OWNER_ID,)
+    )
+
+    await db.commit()
+
+    await message.answer(
+        f"Голосовое добавлено!\n\n"
+        f"Номер: /{voice_id}\n"
+        f"Название: {html.escape(title)}",
+        parse_mode="HTML"
     )
 
     return True
 
 
-async def cancel_add(message: Message, db):
-    if not await require_owner_private(message):
-        return
-
-    await db.execute(
-        "DELETE FROM pending WHERE owner_id = ?",
-        (OWNER_ID,),
-    )
-    await db.commit()
-
-    await message.answer("Добавление голосового отменено.")
-
-
-# ============================================================
-# PLAY VOICE
-# ============================================================
-
 async def send_voice(message: Message, db, voice_id: int):
-    async with db.execute(
-        "SELECT file_id FROM voices WHERE id = ?",
-        (voice_id,),
-    ) as cursor:
-        row = await cursor.fetchone()
+    cursor = await db.execute(
+        "SELECT id, title, file_id FROM voices WHERE id=?",
+        (voice_id,)
+    )
+
+    row = await cursor.fetchone()
+    await cursor.close()
 
     if not row:
         await message.answer(
@@ -387,70 +327,60 @@ async def send_voice(message: Message, db, voice_id: int):
 
     try:
         await message.answer_voice(row["file_id"])
-
-        await db.execute("""
-            UPDATE voices
-            SET play_count = COALESCE(play_count, 0) + 1
-            WHERE id = ?
-        """, (voice_id,))
-
-        await db.commit()
-
-        log.info(
-            "Voice played: id=%s user=%s",
-            voice_id,
-            message.from_user.id if message.from_user else "unknown",
-        )
-
-    except TelegramForbiddenError:
-        log.exception("Bot has no permission to send voice")
-        raise
-
-    except Exception:
-        log.exception("Failed to send voice")
+    except TelegramBadRequest:
+        log.exception("Cannot send voice ID %s", voice_id)
         await message.answer(
-            "Не удалось отправить это голосовое. "
-            "Возможно, Telegram больше не принимает его file_id."
+            "Не удалось отправить голосовое. "
+            "Возможно, файл больше недоступен."
         )
+        return
+
+    await db.execute(
+        "UPDATE voices SET play_count = "
+        "COALESCE(play_count, 0) + 1 WHERE id=?",
+        (voice_id,)
+    )
+    await db.commit()
 
 
-# ============================================================
-# VOICE LIST
-# ============================================================
-
-async def build_voice_list(db, page=1):
-    total = await get_voice_count(db)
+async def show_voices(db, page=1):
+    cursor = await db.execute(
+        "SELECT COUNT(*) AS total FROM voices"
+    )
+    total = (await cursor.fetchone())["total"]
+    await cursor.close()
 
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(1, min(page, pages))
+
     offset = (page - 1) * PAGE_SIZE
 
-    async with db.execute("""
+    cursor = await db.execute("""
         SELECT id, title, play_count
         FROM voices
-        ORDER BY id ASC
+        ORDER BY id
         LIMIT ? OFFSET ?
-    """, (PAGE_SIZE, offset)) as cursor:
-        rows = await cursor.fetchall()
+    """, (PAGE_SIZE, offset))
+
+    rows = await cursor.fetchall()
+    await cursor.close()
 
     if not rows:
-        return "📂 Библиотека пока пустая.", None
+        text = "Библиотека пока пустая."
+    else:
+        lines = [
+            "<b>Библиотека голосовых</b>",
+            ""
+        ]
 
-    lines = ["🎙 <b>Библиотека голосовых</b>\n"]
+        for item in rows:
+            title = html.escape(item["title"] or "Без названия")
+            lines.append(
+                f"/{item['id']}. {title} "
+                f"({item['play_count'] or 0})"
+            )
 
-    for row in rows:
-        title = html.escape(row["title"] or "Без названия")
-        plays = row["play_count"] or 0
-
-        lines.append(
-            f"<code>/{row['id']}</code>. "
-            f"{title} ({plays})"
-        )
-
-    lines.append(
-        f"\nСтраница {page} из {pages}"
-        f" · Всего: {total}"
-    )
+        text = "\n".join(lines)
 
     keyboard = None
 
@@ -461,15 +391,22 @@ async def build_voice_list(db, page=1):
             buttons.append(
                 InlineKeyboardButton(
                     text="⬅️ Назад",
-                    callback_data=f"page:{page - 1}",
+                    callback_data=f"voices:{page - 1}"
                 )
             )
+
+        buttons.append(
+            InlineKeyboardButton(
+                text=f"{page}/{pages}",
+                callback_data="voices:noop"
+            )
+        )
 
         if page < pages:
             buttons.append(
                 InlineKeyboardButton(
                     text="Вперёд ➡️",
-                    callback_data=f"page:{page + 1}",
+                    callback_data=f"voices:{page + 1}"
                 )
             )
 
@@ -477,15 +414,12 @@ async def build_voice_list(db, page=1):
             inline_keyboard=[buttons]
         )
 
-    return "\n".join(lines), keyboard
+    return text, keyboard
 
-
-# ============================================================
-# DELETE VOICE
-# ============================================================
 
 async def delete_voice(message: Message, db):
-    if not await require_owner_private(message):
+    if not is_owner(message) or not is_private(message):
+        await message.answer("Недостаточно прав.")
         return
 
     parts = (message.text or "").split(maxsplit=1)
@@ -498,29 +432,27 @@ async def delete_voice(message: Message, db):
 
     voice_id = int(parts[1])
 
-    async with db.execute(
-        "DELETE FROM voices WHERE id = ?",
-        (voice_id,),
-    ) as cursor:
-        deleted = cursor.rowcount
+    cursor = await db.execute(
+        "DELETE FROM voices WHERE id=?",
+        (voice_id,)
+    )
 
     await db.commit()
 
-    if deleted:
+    if cursor.rowcount:
         await message.answer(
-            f"🗑 Запись №{voice_id} удалена.\n"
-            "Номера остальных записей не изменились."
+            f"Голосовое №{voice_id} удалено.\n"
+            "Остальные номера не изменились."
         )
     else:
         await message.answer("Запись не найдена.")
 
+    await cursor.close()
 
-# ============================================================
-# RENAME VOICE
-# ============================================================
 
 async def rename_voice(message: Message, db):
-    if not await require_owner_private(message):
+    if not is_owner(message) or not is_private(message):
+        await message.answer("Недостаточно прав.")
         return
 
     parts = (message.text or "").split(maxsplit=2)
@@ -541,114 +473,75 @@ async def rename_voice(message: Message, db):
         )
         return
 
-    async with db.execute(
-        "UPDATE voices SET title = ? WHERE id = ?",
-        (title, voice_id),
-    ) as cursor:
-        updated = cursor.rowcount
+    cursor = await db.execute(
+        "UPDATE voices SET title=? WHERE id=?",
+        (title, voice_id)
+    )
 
     await db.commit()
 
-    if updated:
+    if cursor.rowcount:
         await message.answer(
-            f"✏️ Название записи №{voice_id} изменено."
+            f"Название голосового №{voice_id} изменено."
         )
     else:
         await message.answer("Запись не найдена.")
 
+    await cursor.close()
 
-# ============================================================
-# STATISTICS
-# ============================================================
 
-async def show_statistics(message: Message, db):
-    if not await require_owner_private(message):
+async def show_stats(message: Message, db):
+    if not is_owner(message) or not is_private(message):
+        await message.answer("Недостаточно прав.")
         return
 
-    async with db.execute("""
+    cursor = await db.execute("""
         SELECT
             COUNT(*) AS total,
             COALESCE(SUM(play_count), 0) AS plays
         FROM voices
-    """) as cursor:
-        summary = await cursor.fetchone()
+    """)
 
-    async with db.execute("""
+    totals = await cursor.fetchone()
+    await cursor.close()
+
+    cursor = await db.execute("""
         SELECT id, title, play_count
         FROM voices
         ORDER BY play_count DESC, id ASC
         LIMIT 5
-    """) as cursor:
-        top = await cursor.fetchall()
+    """)
 
-    result = (
-        "📊 <b>Статистика библиотеки</b>\n\n"
-        f"Голосовых: {summary['total']}\n"
-        f"Прослушиваний: {summary['plays']}\n"
+    top = await cursor.fetchall()
+    await cursor.close()
+
+    text = (
+        "<b>Статистика библиотеки</b>\n\n"
+        f"Голосовых: <b>{totals['total']}</b>\n"
+        f"Воспроизведений: <b>{totals['plays']}</b>"
     )
 
     if top:
-        result += "\n<b>Топ-5 голосовых:</b>\n"
+        text += "\n\n<b>Топ-5:</b>\n"
 
-        for index, item in enumerate(top, start=1):
-            result += (
-                f"{index}. №{item['id']} — "
-                f"{html.escape(item['title'] or 'Без названия')} "
-                f"({item['play_count'] or 0})\n"
+        for item in top:
+            title = html.escape(item["title"] or "Без названия")
+            text += (
+                f"/{item['id']} — {title}: "
+                f"{item['play_count'] or 0}\n"
             )
 
-    await message.answer(result, parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML")
 
-
-# ============================================================
-# RANDOM VOICE
-# ============================================================
-
-async def random_voice(message: Message, db):
-    async with db.execute(
-        "SELECT id FROM voices ORDER BY RANDOM() LIMIT 1"
-    ) as cursor:
-        row = await cursor.fetchone()
-
-    if not row:
-        await message.answer("Библиотека пока пустая.")
-        return
-
-    await send_voice(message, db, row["id"])
-
-
-# ============================================================
-# BOT COMMANDS
-# ============================================================
-
-async def setup_commands(bot: Bot):
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Информация о боте"),
-        BotCommand(command="help", description="Помощь"),
-        BotCommand(command="voices", description="Список голосовых"),
-        BotCommand(command="randomvoice", description="Случайное голосовое"),
-        BotCommand(command="addvoice", description="Добавить голосовое"),
-        BotCommand(command="deletevoice", description="Удалить голосовое"),
-        BotCommand(command="renamevoice", description="Переименовать"),
-        BotCommand(command="stats", description="Статистика"),
-        BotCommand(command="cancel", description="Отменить добавление"),
-    ])
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Не задан BOT_TOKEN в переменных окружения.")
+        raise RuntimeError("Не задан BOT_TOKEN.")
 
     if OWNER_ID is None:
-        raise RuntimeError(
-            "OWNER_ID должен быть задан числом в переменных окружения."
-        )
+        raise RuntimeError("OWNER_ID должен быть числовым Telegram ID.")
 
-    if PAGE_SIZE < 1 or PAGE_SIZE > 50:
+    if not 1 <= PAGE_SIZE <= 50:
         raise RuntimeError("PAGE_SIZE должен быть от 1 до 50.")
 
     db = await init_db()
@@ -656,151 +549,133 @@ async def main():
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
 
-    me = await bot.get_me()
-    await setup_commands(bot)
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Информация"),
+        BotCommand(command="addvoice", description="Добавить голосовое"),
+        BotCommand(command="voices", description="Список голосовых"),
+        BotCommand(command="randomvoice", description="Случайное голосовое"),
+        BotCommand(command="deletevoice", description="Удалить голосовое"),
+        BotCommand(command="renamevoice", description="Переименовать"),
+        BotCommand(command="stats", description="Статистика"),
+        BotCommand(command="cancel", description="Отменить добавление"),
+    ])
 
-    log.info(
-        "Bot started: @%s | owner=%s | database=%s",
-        me.username,
-        OWNER_ID,
-        DATABASE_PATH,
-    )
-
-    # /start
     @dp.message(Command("start"))
-    @dp.message(Command("help"))
-    async def start_handler(message: Message):
+    async def cmd_start(message: Message):
         await message.answer(
-            "👋 Привет! Я библиотека голосовых сообщений.\n\n"
-            "<b>Команды для всех:</b>\n"
+            "Привет! Я библиотека голосовых.\n\n"
             "/voices — список голосовых\n"
-            "/randomvoice — случайное голосовое\n"
-            "/1, /2, /3 — вызвать голосовое по номеру\n\n"
-            "<b>Команды администратора:</b>\n"
-            "/addvoice — добавить голосовое\n"
-            "/deletevoice 5 — удалить запись\n"
-            "/renamevoice 5 Новое имя — переименовать\n"
-            "/stats — статистика\n"
-            "/cancel — отменить добавление",
-            parse_mode="HTML",
+            "/randomvoice — случайное голосовое\n\n"
+            "Для вызова записи отправь её номер, например /1."
         )
 
-    # Add voice
     @dp.message(Command("addvoice"))
-    async def add_handler(message: Message):
-        await add_voice_start(message, db)
+    async def cmd_add(message: Message):
+        await start_add(message, db)
 
-    # Cancel
     @dp.message(Command("cancel"))
-    async def cancel_handler(message: Message):
+    async def cmd_cancel(message: Message):
         await cancel_add(message, db)
 
-    # Delete
     @dp.message(Command("deletevoice"))
-    async def delete_handler(message: Message):
+    async def cmd_delete(message: Message):
         await delete_voice(message, db)
 
-    # Rename
     @dp.message(Command("renamevoice"))
-    async def rename_handler(message: Message):
+    async def cmd_rename(message: Message):
         await rename_voice(message, db)
 
-    # Statistics
     @dp.message(Command("stats"))
-    async def stats_handler(message: Message):
-        await show_statistics(message, db)
+    async def cmd_stats(message: Message):
+        await show_stats(message, db)
 
-    # List
     @dp.message(Command("voices"))
-    async def voices_handler(message: Message):
+    async def cmd_voices(message: Message):
         parts = (message.text or "").split(maxsplit=1)
-        page = 1
+        page = (
+            int(parts[1])
+            if len(parts) == 2 and parts[1].isdigit()
+            else 1
+        )
 
-        if len(parts) == 2 and parts[1].isdigit():
-            page = int(parts[1])
-
-        text, keyboard = await build_voice_list(db, page)
+        text, keyboard = await show_voices(db, page)
 
         await message.answer(
             text,
             parse_mode="HTML",
-            reply_markup=keyboard,
+            reply_markup=keyboard
         )
 
-    # Pagination
-    @dp.callback_query(F.data.startswith("page:"))
-    async def page_handler(callback: CallbackQuery):
-        try:
-            page = int(callback.data.split(":", 1)[1])
-        except (ValueError, AttributeError):
-            await callback.answer("Некорректная страница.")
+    @dp.callback_query(F.data.startswith("voices:"))
+    async def callback_voices(callback: CallbackQuery):
+        value = callback.data.split(":", 1)[1]
+
+        if value == "noop":
+            await callback.answer()
             return
 
-        text, keyboard = await build_voice_list(db, page)
+        text, keyboard = await show_voices(db, int(value))
 
-        if callback.message:
-            try:
-                await callback.message.edit_text(
-                    text,
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
-                )
-            except TelegramBadRequest as exc:
-                if "message is not modified" not in str(exc).lower():
-                    log.exception("Pagination edit failed")
+        try:
+            await callback.message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
 
         await callback.answer()
 
-    # Random voice
     @dp.message(Command("randomvoice"))
-    async def random_handler(message: Message):
-        await random_voice(message, db)
-
-    # Receive voice during adding
-    @dp.message(F.voice)
-    async def voice_handler(message: Message):
-        await receive_voice(message, db)
-
-    # Text handler: title or numeric command
-    @dp.message(F.text)
-    async def text_handler(message: Message):
-        if await receive_title(message, db):
-            return
-
-        text = (message.text or "").strip()
-
-        username_part = (
-            r"(?:@" + re.escape(me.username) + r")?"
-            if me.username else ""
+    async def cmd_random(message: Message):
+        cursor = await db.execute(
+            "SELECT id FROM voices ORDER BY RANDOM() LIMIT 1"
         )
 
+        row = await cursor.fetchone()
+        await cursor.close()
+
+        if not row:
+            await message.answer("Библиотека пока пустая.")
+            return
+
+        await send_voice(message, db, row["id"])
+
+    @dp.message(F.voice)
+    async def on_voice(message: Message):
+        await accept_voice(message, db)
+
+    @dp.message(F.text)
+    async def on_text(message: Message):
+        if await accept_title(message, db):
+            return
+
         match = re.fullmatch(
-            r"/([1-9][0-9]*)" + username_part,
-            text,
-            re.IGNORECASE,
+            r"/([1-9][0-9]*)(?:@[A-Za-z0-9_]+)?",
+            (message.text or "").strip()
         )
 
         if match:
             await send_voice(
                 message,
                 db,
-                int(match.group(1)),
+                int(match.group(1))
             )
 
-    try:
-        await dp.start_polling(bot)
+    me = await bot.get_me()
+    log.info("Bot started: @%s, ID=%s", me.username, me.id)
 
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types()
+        )
     finally:
         await db.close()
         await bot.session.close()
 
 
-# ============================================================
-# START
-# ============================================================
-
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Bot stopped")
+    asyncio.run(main())
